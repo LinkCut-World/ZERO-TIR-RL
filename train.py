@@ -69,12 +69,6 @@ class AgentRLConfig(GRPOConfig):
         }
     )
 
-    dump_dir: str = field(
-        default="./dump",
-        metadata={
-            "help": "directory to dump the trajectories"
-        }
-    )
     verbose: bool = field(
         default=True,
         metadata={
@@ -186,15 +180,7 @@ class TIRWorkflow(RolloutWorkflow):
         self.config = config
         self.gconfig = config.gconfig
         self.tokenizer = tokenizer
-        self._qid_locks = {}
-        self._locks_lock = threading.Lock()
         self.current_trajs = 0
-
-    def _get_qid_lock(self, qid):
-        with self._locks_lock:
-            if qid not in self._qid_locks:
-                self._qid_locks[qid] = threading.Lock()
-            return self._qid_locks[qid]
 
     async def collect_agent_trajectory(self, qid, prompt, answer, engine):
         traj_rid = uuid.uuid4().hex
@@ -306,19 +292,6 @@ class TIRWorkflow(RolloutWorkflow):
                 log_file.write(res_dump['input_str'].__str__() + "\n" + res_dump['metadata'].__str__() + "\n")
         self.current_trajs += 1
 
-        if self.config.dump_dir is not None:
-            dump_path = os.path.join(self.config.dump_dir, f"{qid}.json")
-            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-            
-            qid_lock = self._get_qid_lock(qid)
-            with qid_lock:
-                with open(dump_path, "a") as f:
-                    json.dump(res_dump, f)
-                
-            dump_path = os.path.join(self.config.dump_dir, f"{qid}_{traj_rid}.json")
-            with open(dump_path, "w") as f:
-                json.dump(res_dump, f)
-
         res = {k: v.unsqueeze(0) for k, v in res.items()}
         return TensorDict(res, batch_size=[1])
 
@@ -352,15 +325,6 @@ def main(args):
     config, _ = load_expr_config(args, AgentRLConfig)
     config: AgentRLConfig
 
-
-    config.dump_dir = os.path.join(
-        StatsLogger.get_log_path(config.stats_logger), "generated"
-    )
-
-    if os.path.exists(config.dump_dir):
-        shutil.rmtree(config.dump_dir)
-    os.makedirs(config.dump_dir, exist_ok=True)
-    
     with open('orz_math_57k_collected.json', 'r') as f:
         raw_data = json.load(f)
 
@@ -399,9 +363,6 @@ def main(args):
         config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
-
-    if config.verbose:
-        print(">>>", "dump dir:", config.dump_dir)
 
     workflow = TIRWorkflow(
         config=config,
@@ -523,7 +484,6 @@ def main(args):
         stats[0]["avg_code_in_correct"] = avg_code_in_correct
         stats[0]["avg_length"] = avg_length
         stat_logger.commit(epoch, step, global_step, stats)
-        # easy_log(epoch, step, global_step, batch, stats)
 
         with stats_tracker.record_timing("save"):
             saver.save(actor, epoch, step, global_step)
