@@ -170,6 +170,7 @@ from code_executor import execute_code
 
 import shutil
 import pickle
+from datasets import Dataset as HFDataset
 
 class TIRWorkflow(RolloutWorkflow):
     def __init__(
@@ -179,6 +180,7 @@ class TIRWorkflow(RolloutWorkflow):
     ):
         self.config = config
         self.gconfig = config.gconfig
+        self.gconfig.n_samples = 1
         self.tokenizer = tokenizer
         self.current_trajs = 0
 
@@ -315,7 +317,7 @@ class TIRWorkflow(RolloutWorkflow):
         return concat_padded_tensors(trajs)
 
 def main(args):
-    swanlab.sync_wandb()
+    # swanlab.sync_wandb()
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
     with open("example_trajs.log", "w") as log_file:
         log_file.write("")
@@ -323,40 +325,55 @@ def main(args):
     config, _ = load_expr_config(args, AgentRLConfig)
     config: AgentRLConfig
 
+    rank = int(os.getenv("RANK"))
+    world_size = int(os.getenv("WORLD_SIZE"))
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
+
+    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
+
     with open('orz_math_57k_collected.json', 'r') as f:
         raw_data = json.load(f)
-
     def process_raw_data(item):
         return {
             "question": item[0]['value'],
             "answer": item[1]['ground_truth']['value'],
         }
-
     dataset = [process_raw_data(item) for item in raw_data]
+    hf_dataset = HFDataset.from_list(dataset)
+    dataset = split_dataset_by_node(hf_dataset, rank=rank, world_size=world_size)
 
+    worker_batch_size = config.train_dataset.batch_size // world_size
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=config.train_dataset.batch_size,
+        batch_size=config.train_dataset.batch_size // world_size,
         shuffle=config.train_dataset.shuffle,
         num_workers=config.train_dataset.num_workers,
         collate_fn=lambda x: x,
         drop_last=config.train_dataset.drop_last,
     )
-
-    data_generator = cycle(dataloader)
-
     ft_spec = FinetuneSpec(
         total_train_epochs=config.total_train_epochs,
         dataset_size=len(dataloader) * config.train_dataset.batch_size,
         train_batch_size=config.train_dataset.batch_size,
     )
 
-    example_batch = next(data_generator)
+    rollout = RemoteSGLangEngine(config.rollout)
+    rollout.initialize(None, None)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
+    actor = FSDPPPOActor(config=config.actor)
+    actor.initialize(None, ft_spec)
+    ref = None
+
+    weight_update_meta = [WeightUpdateMeta.from_disk(
+        experiment_name=config.saver.experiment_name,
+        trial_name=config.saver.trial_name,
+        file_root=config.saver.fileroot,
+    )]
+    dist.broadcast_object_list(weight_update_meta, src=0)
+    weight_update_meta = weight_update_meta[0]
+
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-
     if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
@@ -367,34 +384,15 @@ def main(args):
         tokenizer=tokenizer,
     )
 
-    rollout = RemoteSGLangEngine(config.rollout)
-    rollout.initialize(None, None)
-
-    rank = int(os.getenv("RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
-    assert world_size == 1, "This script is designed to run in a single process environment."
-    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
-
-    worker_batch_size = config.train_dataset.batch_size
-
-    actor = FSDPPPOActor(config=config.actor)
-    actor.initialize(None, ft_spec)
-    ref = None
-
-    weight_update_meta = WeightUpdateMeta.from_disk(
-        experiment_name=config.saver.experiment_name,
-        trial_name=config.saver.trial_name,
-        file_root=config.saver.fileroot,
-    )
-
     saver = Saver(config.saver, ft_spec)
     stat_logger = StatsLogger(config.stats_logger, ft_spec)
 
     total_epochs = config.total_train_epochs
     steps_per_epoch = len(dataloader)
     max_steps = total_epochs * steps_per_epoch
-    start_step = config.recover_start_step or 0
 
+    data_generator = iter(dataloader)
+    start_step = config.recover_start_step or 0
     log_debug_batch = False
     for global_step in range(start_step, max_steps):
         epoch = global_step // steps_per_epoch
@@ -404,6 +402,7 @@ def main(args):
         with stats_tracker.record_timing("rollout"):
             if config.async_training:
                 batch = rollout.prepare_batch(dataloader, workflow=workflow)
+
                 batch_total_len = len(batch) * len(batch[0]["input_ids"])
                 logger.info(f"Got batch with len {len(batch)} and per tokens {len(batch[0]['input_ids'])}, total tokens {batch_total_len}")
 
@@ -415,22 +414,10 @@ def main(args):
                     data = next(data_generator)
                 batch = rollout.rollout_batch(data, workflow=workflow)
 
-        # batch[0]:
-        # TensorDict(
-        #     fields={
-        #         attention_mask: Tensor(shape=torch.Size([491]), device=cpu, dtype=torch.bool, is_shared=False),
-        #         input_ids: Tensor(shape=torch.Size([491]), device=cpu, dtype=torch.int64, is_shared=False),
-        #         logprobs: Tensor(shape=torch.Size([491]), device=cpu, dtype=torch.float32, is_shared=False),
-        #         loss_mask: Tensor(shape=torch.Size([491]), device=cpu, dtype=torch.bool, is_shared=False),
-        #         rewards: Tensor(shape=torch.Size([]), device=cpu, dtype=torch.float32, is_shared=False)},
-        #     batch_size=torch.Size([]),
-        #     device=None,
-        #     is_shared=False)
-
-        avg_reward = torch.stack([td["score"].float() for td in batch]).mean().item()
-        avg_code_reward = torch.stack([td["code_reward"].float() for td in batch]).mean().item()
-        avg_code_in_correct = torch.stack([td["code_in_correct"].float() for td in batch]).mean().item()
-        avg_length = torch.stack([td["attention_mask"].float().sum() for td in batch]).mean().item()
+        avg_reward = batch["score"].mean().item()
+        avg_code_reward = batch["code_reward"].mean().item()
+        avg_code_in_correct = batch["code_in_correct"].mean().item()
+        avg_length = (batch["attention_mask"].sum(1)).float().mean().item()
 
         if (not log_debug_batch) and avg_code_reward > 0:
             log_debug_batch = True
@@ -438,6 +425,8 @@ def main(args):
                 pickle.dump(batch, log_file)
 
         batch = batch.to(actor.device)
+        dist.barrier(device_ids=[actor.device.index])
+        torch.cuda.synchronize()
 
         if config.actor.recompute_logprob or config.actor.use_decoupled_loss:
             with stats_tracker.record_timing("recompute_logp"):
@@ -468,14 +457,19 @@ def main(args):
         
         with stats_tracker.record_timing("update_weights"):
             rollout.pause()
-            future = rollout.update_weights(weight_update_meta)
+            if dist.get_rank() == 0:
+                future = rollout.update_weights(weight_update_meta)
             actor.upload_weights(weight_update_meta)
-            future.result()
+            if dist.get_rank() == 0:
+                future.result()
             dist.barrier(device_ids=[actor.device.index])
             torch.cuda.synchronize()
             rollout.resume()
             actor.set_version(global_step + 1)
             rollout.set_version(global_step + 1)
+
+        with stats_tracker.record_timing("save"):
+            saver.save(actor, epoch, step, global_step)
 
         stats[0]["avg_reward"] = avg_reward
         stats[0]["avg_code_reward"] = avg_code_reward
@@ -483,14 +477,12 @@ def main(args):
         stats[0]["avg_length"] = avg_length
         stat_logger.commit(epoch, step, global_step, stats)
 
-        with stats_tracker.record_timing("save"):
-            saver.save(actor, epoch, step, global_step)
-
     stat_logger.close()
     rollout.destroy()
     if ref is not None:
         ref.destroy()
     actor.destroy()
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
