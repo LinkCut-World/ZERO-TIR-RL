@@ -62,10 +62,10 @@ class AgentRLConfig(GRPOConfig):
             "help": "We could collect multiple trajectories for a single query. By default n_trajs=1."
         }
     )
-    executor_url: str = field(
-        default="http://localhost:1451",
+    code_execution_timeout: int = field(
+        default=10,
         metadata={
-            "help": "URL of the code executor service"
+            "help": "timeout (in seconds) for code execution"
         }
     )
 
@@ -141,71 +141,6 @@ from areal.utils.device import log_gpu_stats
 
 import re
 
-import aiohttp
-from typing import Dict, Any
-class CodeExecutorClient:
-    def __init__(self, server_url: str, timeout = 10, max_retries: int = 3):
-        self.server_url = server_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.session = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    async def execute_code(self, code: str, timeout: int = 10, traj_rid=None) -> Dict[str, Any]:
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        for _ in range(self.max_retries):
-            try:
-                async with self.session.post(
-                    f"{self.server_url}/execute",
-                    json={"code": code, "timeout": timeout, "traj_rid": traj_rid},
-                    timeout=aiohttp.ClientTimeout(total=timeout + 5)
-                ) as response:
-                    result = await response.json()
-
-            except Exception as e:
-                result = {
-                    "success": False,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": {
-                        "type": type(e).__name__,
-                        "message": str(e),
-                        "traceback": ""
-                    }
-                }
-            if result.get("success", False):
-                return result
-        return result
-    
-    async def health_check(self) -> bool:
-        """
-        检查服务器是否健康
-        
-        Returns:
-            服务器是否可用
-        """
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        
-        try:
-            async with self.session.get(
-                f"{self.server_url}/health",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result.get("status") == "healthy"
-                return False
-        except:
-            return False
 
 # PROMPT_TEMPLATE = """
 # A conversation between User and Assistant. 
@@ -236,7 +171,9 @@ def get_prompt(tokenizer, query):
 
 import re
 import threading
-from code_executor_client import execute_python_code
+
+from code_executor import execute_code
+
 import shutil
 import pickle
 
@@ -245,14 +182,12 @@ class TIRWorkflow(RolloutWorkflow):
         self, 
         config: AgentRLConfig, 
         tokenizer: PreTrainedTokenizerFast,
-        code_executor,
     ):
         self.config = config
         self.gconfig = config.gconfig
         self.tokenizer = tokenizer
         self._qid_locks = {}
         self._locks_lock = threading.Lock()
-        self.code_executor = code_executor
         self.current_trajs = 0
 
     def _get_qid_lock(self, qid):
@@ -313,16 +248,10 @@ class TIRWorkflow(RolloutWorkflow):
                 if matches:
                     code = matches[-1]
                     exec_start_time = time.time()
-                    exec_result = await self.code_executor.execute_code(code, traj_rid=traj_rid)
+                    execution_output = await loop.run_in_executor(None, functools.partial(execute_code, code, self.config.code_execution_timeout))
+
                     exec_time = time.time() - exec_start_time
                     total_exec_time += exec_time
-                    
-                    if exec_result["success"]:
-                        execution_output = exec_result["content"]
-                    else:
-                        # 服务端错误
-                        logger.error(f"Code execution failed: {exec_result['error']['message']}")
-                        execution_output = "代码执行失败。"
                     
                     num_turns += 1
                     
@@ -372,7 +301,7 @@ class TIRWorkflow(RolloutWorkflow):
             "result": result,
         }
 
-        if self.config.verbose and (self.current_trajs % 100 == 0 or (res_dump['metadata']['reward'] > 0 and res_dump['metadata']['num_turns'] >= 1)):
+        if self.config.verbose and self.current_trajs % 100 == 0:
             with open("example_trajs.log", "a") as log_file:
                 log_file.write(res_dump['input_str'].__str__() + "\n" + res_dump['metadata'].__str__() + "\n")
         self.current_trajs += 1
@@ -471,62 +400,12 @@ def main(args):
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
 
-    code_executor = CodeExecutorClient(config.executor_url)
-
     if config.verbose:
         print(">>>", "dump dir:", config.dump_dir)
-
-        # print(">>>", len(raw_data)) # 56878
-        # print(">>>", raw_data[2]) # [{'from': 'human', 'value': 'Consider all 1000-element subsets of the set $\\{1, 2, 3, ... , 2015\\}$.  From each such subset choose the least element.  The arithmetic mean of all of these least elements is $\\frac{p}{q}$, where $p$ and $q$ are relatively prime positive integers.  Find $p + q$.'}, {'from': 'assistant', 'ground_truth': {'value': '431'}}]
-
-        # print(">>>", dataset[2])
-
-        # print(">>>", len(example_batch))
-        # print(">>>", example_batch[0])
-
-        # answer_test_str = r"""
-        # <answer>72
-        # <answer>82</answer>
-        # <answer>line1
-        # line2</answer>
-        # """
-
-        # answer_matches = re.findall(r'<answer>(.*?)</answer>', answer_test_str, re.DOTALL)
-
-        # print(">>>", answer_matches)
-
-        # code_test_str = r"""
-        # ```python
-        # import numpy as np
-
-        # result = 2**31 - 1
-        # print(result)
-        # ```
-
-        # ```python
-        # def foo(x):
-        #     return x + 1
-        # print(foo(1))
-        # ```
-
-        # ```python
-        # print(123)
-        # print(foo(1))
-        # ```
-        # """
-
-        # code_matches = re.findall(r'```python(.*?)```', code_test_str, re.DOTALL)
-
-        # print(">>>", code_matches)
-        # print(">>>", asyncio.run(code_executor.health_check()))
-        # for code in code_matches:
-        #     print(">>>", asyncio.run(code_executor.execute_code(code)))
-        # print(">>>", PROMPT_TEMPLATE.format(query="What is 1+1?"))
 
     workflow = TIRWorkflow(
         config=config,
         tokenizer=tokenizer,
-        code_executor=code_executor,
     )
 
     rollout = RemoteSGLangEngine(config.rollout)

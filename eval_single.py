@@ -64,10 +64,10 @@ class AgentRLConfig(GRPOConfig):
             "help": "We could collect multiple trajectories for a single query. By default n_trajs=1."
         }
     )
-    executor_url: str = field(
-        default="http://localhost:1451",
+    code_execution_timeout: int = field(
+        default=10,
         metadata={
-            "help": "URL of the code executor service"
+            "help": "timeout (in seconds) for code execution"
         }
     )
 
@@ -143,72 +143,6 @@ from areal.utils.device import log_gpu_stats
 
 import re
 
-import aiohttp
-from typing import Dict, Any
-class CodeExecutorClient:
-    def __init__(self, server_url: str, timeout = 10, max_retries: int = 3):
-        self.server_url = server_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.session = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    async def execute_code(self, code: str, timeout: int = 10, traj_rid=None) -> Dict[str, Any]:
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        for _ in range(self.max_retries):
-            try:
-                async with self.session.post(
-                    f"{self.server_url}/execute",
-                    json={"code": code, "timeout": timeout, "traj_rid": traj_rid},
-                    timeout=aiohttp.ClientTimeout(total=timeout + 5)
-                ) as response:
-                    result = await response.json()
-
-            except Exception as e:
-                result = {
-                    "success": False,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": {
-                        "type": type(e).__name__,
-                        "message": str(e),
-                        "traceback": ""
-                    }
-                }
-            if result.get("success", False):
-                return result
-        return result
-    
-    async def health_check(self) -> bool:
-        """
-        检查服务器是否健康
-        
-        Returns:
-            服务器是否可用
-        """
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        
-        try:
-            async with self.session.get(
-                f"{self.server_url}/health",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result.get("status") == "healthy"
-                return False
-        except:
-            return False
-
 # PROMPT_TEMPLATE = """
 # A conversation between User and Assistant. 
 # The User asks a question, and the Assistant solves it. 
@@ -238,7 +172,7 @@ def get_prompt(tokenizer, query):
 
 import re
 import threading
-from code_executor_client import execute_python_code
+from code_executor import execute_code
 import shutil
 import pickle
 
@@ -247,13 +181,11 @@ class TIRWorkflow(RolloutWorkflow):
         self, 
         config: AgentRLConfig, 
         tokenizer: PreTrainedTokenizerFast,
-        code_executor,
     ):
         self.config = copy.deepcopy(config)
         self.gconfig = config.gconfig
         self.tokenizer = tokenizer
         self.dump_lock = threading.Lock()
-        self.code_executor = code_executor
         self.current_trajs = 0
 
     async def collect_agent_trajectory(self, qid, prompt, answer, engine):
@@ -308,16 +240,10 @@ class TIRWorkflow(RolloutWorkflow):
                 if matches:
                     code = matches[-1]
                     exec_start_time = time.time()
-                    exec_result = await self.code_executor.execute_code(code, traj_rid=traj_rid)
+                    execution_output = await loop.run_in_executor(None, functools.partial(execute_code, code, self.config.code_execution_timeout))
+
                     exec_time = time.time() - exec_start_time
                     total_exec_time += exec_time
-                    
-                    if exec_result["success"]:
-                        execution_output = exec_result["content"]
-                    else:
-                        # 服务端错误
-                        logger.error(f"Code execution failed: {exec_result['error']['message']}")
-                        execution_output = "代码执行失败。"
                     
                     num_turns += 1
                     
@@ -463,12 +389,9 @@ def main(args):
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
 
-    code_executor = CodeExecutorClient(config.executor_url)
-
     workflow = TIRWorkflow(
         config=config,
         tokenizer=tokenizer,
-        code_executor=code_executor,
     )
 
     rollout = RemoteSGLangEngine(config.rollout)
@@ -487,24 +410,6 @@ def main(args):
         os.makedirs(os.path.dirname(dump_dir), exist_ok=True)
         with open(dump_dir, "w") as f:
             f.write("")
-
-        # batches = []
-        # for j in range(0, len(dataset_s[i]), config.train_dataset.batch_size):
-        #     logger.info(f"Processing {j}/{len(dataset_s[i])}")
-        #     data = dataset_s[i].select(range(j, min(j + config.train_dataset.batch_size, len(dataset_s[i]))))
-        #     batch = rollout.rollout_batch(data, workflow=workflow)
-        #     batch["length"] = batch["attention_mask"].sum(1)
-        #     del batch["input_ids"]
-        #     del batch["logprobs"]
-        #     del batch["attention_mask"]
-        #     del batch["loss_mask"]
-        #     batch["attention_mask"] = batch["extracted"]
-        #     batch["input_ids"] = batch["extracted"]
-        #     batch["logprobs"] = torch.zeros_like(batch["extracted"], dtype=torch.float32)
-        #     batch["loss_mask"] = torch.zeros_like(batch["extracted"], dtype=torch.float32)
-        #     batches.append(batch)
-        # logger.info(f"Processing {len(dataset_s[i])}/{len(dataset_s[i])} done")
-        # batch = concat_padded_tensors(batches)
 
         # example_data = dataset_s[i].select(range(2))
         workflow.config.dump_dir = dump_dir
@@ -543,11 +448,6 @@ def main(args):
 
     logger.info("finished evaluation, destroying ...")
     rollout.destroy()
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        loop.create_task(code_executor.session.close())
-    else:
-        loop.run_until_complete(code_executor.session.close())
     logger.info("destroyed.")
 
 if __name__ == "__main__":
