@@ -315,8 +315,6 @@ class TIRWorkflow(RolloutWorkflow):
         return concat_padded_tensors(trajs)
 
 def main(args):
-    print(args)
-    print(">>>>>>>")
     swanlab.sync_wandb()
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
     with open("example_trajs.log", "w") as log_file:
@@ -401,13 +399,13 @@ def main(args):
     for global_step in range(start_step, max_steps):
         epoch = global_step // steps_per_epoch
         step = global_step % steps_per_epoch
-        print(f"Epoch {epoch}. Step: {step}/{steps_per_epoch}")
+        logger.info(f"Epoch {epoch}. Step: {step}/{steps_per_epoch}")
 
         with stats_tracker.record_timing("rollout"):
             if config.async_training:
                 batch = rollout.prepare_batch(dataloader, workflow=workflow)
                 batch_total_len = len(batch) * len(batch[0]["input_ids"])
-                print(f"Got batch with len {len(batch)} and per tokens {len(batch[0]['input_ids'])}, total tokens {batch_total_len}")
+                logger.info(f"Got batch with len {len(batch)} and per tokens {len(batch[0]['input_ids'])}, total tokens {batch_total_len}")
 
             else:
                 try:
