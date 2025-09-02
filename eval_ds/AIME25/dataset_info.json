@@ -1,0 +1,42 @@
+{
+  "builder_name": "json",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "aime25",
+  "dataset_size": 14799,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/math-ai/aime25@7510e41db03507cb7b25add80804e23c44f4d472/test.jsonl": {
+      "num_bytes": 15813,
+      "checksum": null
+    }
+  },
+  "download_size": 15813,
+  "features": {
+    "answer": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "question": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 30612,
+  "splits": {
+    "test": {
+      "name": "test",
+      "num_bytes": 14799,
+      "num_examples": 30,
+      "dataset_name": "aime25"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

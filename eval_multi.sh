@@ -1,0 +1,1 @@
+HF_ENDPOINT=https://hf-mirror.com python eval_multi.py 2>&1 | tee eval.log
