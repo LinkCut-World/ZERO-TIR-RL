@@ -1,6 +1,6 @@
 experiment_name: tir-grpo
 trial_name: trial0
-allocation_mode: sglang.d2t1p1+eval
+allocation_mode: sglang.d1t1p1+d1t1p1
 cluster:
   fileroot: /home/liangchengwei/lcw/ZERO-TIR-RL/experiments
   n_nodes: 1
@@ -10,24 +10,28 @@ cluster:
     nfs_record_root: /home/liangchengwei/lcw/ZERO-TIR-RL/name_resolve
 seed: 1
 total_train_epochs: 10
-tokenizer_path: Qwen/Qwen2.5-1.5B
+tokenizer_path: ${actor.path}
 async_training: true
 
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 8
-  queue_size: 10000
+  queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
-  max_head_offpolicyness: 10000
+  max_head_offpolicyness: 4
   enable_rollout_tracing: false
 
 gconfig:
-  n_samples: 4
+  n_samples: 16
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 1024
   greedy: false
   temperature: 1.0
+  stop_token_ids: [
+    151643, # <|endoftext|>
+    151645, # <|im_end|>
+  ]
 
 actor:
   experiment_name: ${experiment_name}
@@ -74,29 +78,29 @@ ref:
 # SGLang
 sglang:
   model_path: ${actor.path}
-  tokenizer_path: ${tokenizer_path}
   random_seed: ${seed}
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
   max_running_requests: null
   context_length: 32768
   mem_fraction_static: 0.8
+  attention_backend: fa3
 
 # datasets
 train_dataset:
-  batch_size: 8
+  batch_size: 1
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hardcoded
   type: rl
 
 valid_dataset:
-  batch_size: 8
+  batch_size: 1
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: no_validation
   type: rl
 
 # Utilities
@@ -143,6 +147,8 @@ launcher:
   trainer_cpus_per_gpu: 15
   trainer_mem_per_gpu: 153600
 
-verbose: false
-n_trajs: 8
+verbose: true
+n_trajs: 1
 max_tokens_per_traj: 4000
+max_turns: 128
+code_execution_timeout: 10

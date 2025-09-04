@@ -91,10 +91,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 from realhf.impl.dataset.math_parser import extract_answer, math_equal
 
-rw_executor = ProcessPoolExecutor(max_workers=4)
-REWARD_TIMEOUT_SECONDS = 15
-
 def reward_fn(generated, answer):
+    matches = re.findall(r"<answer>(.*?)</answer>", generated, re.DOTALL)
+    if not matches:
+        return 0.0
+    generated = matches[-1]
     try:
         x = extract_answer(generated, "math", use_last_number=True)
         y = extract_answer(answer, "math", use_last_number=True)
@@ -135,42 +136,27 @@ from areal.utils.device import log_gpu_stats
 
 import re
 
-
-# PROMPT_TEMPLATE = """
-# A conversation between User and Assistant. 
-# The User asks a question, and the Assistant solves it. 
-# The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. 
-# In your reasoning-process, You can use python-code to solve your problem. Put the code within ```python and ``` tags, and the code will be executed immediately and output will be returned.
-# User: You must put your answer inside <answer> </answer> tags, i.e., <answer> answer here </answer>. 
-# And your final answer will be extracted automatically by the \\boxed{{}} tag.\nThis is the problem:{query}\nAssistant: <think>
-# """
-
-# def get_prompt(tokenizer, query):
-#     return PROMPT_TEMPLATE.format(query=query)
-
 SYSTEM_PROMPT = """
-You are a helpful assistant. The User asks a question, and the Assistant solves it. 
-The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. And your final answer will be extracted automatically by the \\boxed{{}} tag.
-In your reasoning-process, You can use python-code to solve your problem. Put the code within ```python and ``` tags. The script will be executed immediately and output will be returned.
+A conversation between User and Assistant. 
+The User asks a question, and the Assistant solves it. 
+The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The answer is enclosed within <answer> </answer> tags, respectively, i.e., <answer> answer here </answer>. And the final answer will be extracted automatically by the \\boxed{} tag.
+In the reasoning-process, the Assistant can use python-code to solve the problem. 
 """
 
-def get_prompt(tokenizer, query):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": query}
-    ]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    text += "<think>\n"
-    return text
+import code_executor
 
-import re
-import threading
-
-from code_executor import execute_code
+def execute_code(code, timeout):
+    res = code_executor.execute_code(code, timeout=timeout)
+    if res == "":
+        return "No output. Use `print()` to see the result. Try again.\n"
+    return res
 
 import shutil
 import pickle
 from datasets import Dataset as HFDataset
+from areal.api.reward_api import AsyncRewardWrapper
+from areal.experimental.openai import ArealOpenAI
+import copy
 
 class TIRWorkflow(RolloutWorkflow):
     def __init__(
@@ -188,86 +174,79 @@ class TIRWorkflow(RolloutWorkflow):
         with open(self.example_trajs_path, "w") as log_file:
             log_file.write("")
 
-    async def collect_agent_trajectory(self, qid, prompt, answer, engine):
-        traj_rid = uuid.uuid4().hex
-        loop = asyncio.get_event_loop()
-        result = None
-        reward = 0.0
+        self.async_reward_fn = AsyncRewardWrapper(reward_fn)
+        self.async_code_exec = AsyncRewardWrapper(execute_code)
+
+
+    async def collect_agent_trajectory(self, qid, messages, answer, engine):
+        client = ArealOpenAI(engine=engine, tokenizer=self.tokenizer)
+        messages = copy.deepcopy(messages)
 
         num_turns = 0
-        input_str = prompt
-        input_ids = self.tokenizer.encode(input_str, add_special_tokens=False)
-        logprobs = [0.0] * len(input_ids)
-        loss_mask = [0] * len(input_ids)
-        stops = ["```python", "</answer>"]
         total_gen_time = 0
         total_exec_time = 0
         start_time = time.time()
+        comp_ids = []
         while num_turns < self.config.max_turns:
-            req = ModelRequest(
-                rid=traj_rid,
-                input_ids=input_ids,
-                gconfig=self.gconfig.new(n_samples=1),
-            )
-            req.gconfig.stop = stops
-            if len(input_ids) + self.gconfig.max_new_tokens >= self.config.max_tokens_per_traj:
-                break
-            
+            # if len(input_ids) + self.gconfig.max_new_tokens >= self.config.max_tokens_per_traj:
+            #     break
             gen_start_time = time.time()
-            resp = await engine.agenerate(req)
+            _comp = await client.chat.completions.create(
+                messages=messages,
+                frequency_penalty=self.gconfig.frequency_penalty,
+                max_completion_tokens=self.gconfig.max_new_tokens,
+                stop=self.gconfig.stop,
+                store=True,
+                temperature=self.gconfig.temperature,
+                top_p=self.gconfig.top_p,
+                tools=[
+                    {
+                        "type": "custom",
+                        "name": "code_exec",
+                        "description": "Executes arbitrary Python code.",
+                    }
+                ],
+                tool_choice="auto",
+            )
+            comp = client.get_completions(_comp.id)
             gen_time = time.time() - gen_start_time
             total_gen_time += gen_time
-            completion_str = self.tokenizer.decode(resp.output_tokens)
 
-            input_str += completion_str
-            input_ids += resp.output_tokens
-            logprobs += resp.output_logprobs
-            loss_mask += [1] * len(resp.output_tokens)
+            resp = _comp.choices[0]
+            messages += [resp.message]
+            comp_ids += [_comp.id]
 
-            if "</answer>" in completion_str:
-                matches = re.findall(r"<answer>(.*?)</answer>", completion_str, re.DOTALL)
-                if matches:
-                    result = matches[-1]
-                    reward = await loop.run_in_executor(
-                        rw_executor,
-                        functools.partial(reward_fn, result, answer)
-                    )
-                    break
-            elif stops[0] == "```python" and "```python" in completion_str:
-                stops[0] = "```"
-            elif stops[0] == "```" and "```" in completion_str:
-                matches = re.findall(r'```python(.*?)```', input_str, re.DOTALL)
-                if matches:
-                    code = matches[-1]
-                    exec_start_time = time.time()
-                    execution_output = await loop.run_in_executor(None, functools.partial(execute_code, code, self.config.code_execution_timeout))
+            if resp.finish_reason == "tool_use":
+                num_turns += 1
+                tool_call = resp.message.tool_calls[0]
+                code = tool_call.custom.input
 
-                    exec_time = time.time() - exec_start_time
-                    total_exec_time += exec_time
-                    
-                    num_turns += 1
-                    
-                    empty_output = execution_output.strip() == ""
-                    execution_output = "\n```output\n" + execution_output + "\n```\n"
-                    if empty_output:
-                        execution_output += "No output. Let me use `print()` to see the result and try again.\n"
-                    input_str += execution_output
-                    exec_tokens = self.tokenizer.encode(execution_output, add_special_tokens=False)
-                    if len(input_ids) + len(exec_tokens) >= self.config.max_tokens_per_traj:
-                        exec_tokens = exec_tokens[:self.config.max_tokens_per_traj - len(input_ids) - 1]
-                    input_ids += exec_tokens
-                    logprobs += [0.0] * len(exec_tokens)
-                    loss_mask += [0] * len(exec_tokens)
-                stops[0] = "```python"
-            
-            if resp.output_tokens[-1] in [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
+                exec_start_time = time.time()
+                execution_output = await self.async_code_exec(code, self.config.code_execution_timeout)
+                exec_time = time.time() - exec_start_time
+                total_exec_time += exec_time
+                
+                messages += [
+                    {
+                        "role": "tool",
+                        "content": execution_output,
+                        "tool_call_id": tool_call.id,
+                    }
+                ]
+            elif resp.finish_reason == "stop":
                 break
-
+        
+        
+        reward = await self.async_reward_fn(
+            self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ),
+            answer,
+        )
+        for id in comp_ids:
+            client.set_reward(id, reward)
         total_time = time.time() - start_time
 
-        if len(input_ids) > self.config.max_tokens_per_traj:
-            assert False, f"Trajectory {traj_rid} exceeds max tokens {self.config.max_tokens_per_traj} with {len(input_ids)} tokens."
-        
         res = dict(
             input_ids=torch.tensor(input_ids),
             logprobs=torch.tensor(logprobs),
@@ -299,7 +278,7 @@ class TIRWorkflow(RolloutWorkflow):
         self.current_trajs += 1
 
         res = {k: v.unsqueeze(0) for k, v in res.items()}
-        return TensorDict(res, batch_size=[1])
+        return client.export_completions(turn_discount=0.0)
 
     async def arun_episode(self, engine, data):
         qid = uuid.uuid4().hex

@@ -72,7 +72,7 @@ class AgentRLConfig(GRPOConfig):
     )
 
     dump_dir: str = field(
-        default="./dump",
+        default="./eval",
         metadata={
             "help": "directory to dump the trajectories"
         }
@@ -172,7 +172,7 @@ def get_prompt(tokenizer, query):
 
 import re
 import threading
-from code_executor import execute_code
+from ..code_executor import execute_code
 import shutil
 import pickle
 
@@ -184,9 +184,14 @@ class TIRWorkflow(RolloutWorkflow):
     ):
         self.config = copy.deepcopy(config)
         self.gconfig = config.gconfig
+        self.gconfig.n_samples = 1
         self.tokenizer = tokenizer
         self.dump_lock = threading.Lock()
         self.current_trajs = 0
+
+        self.example_trajs_path = os.path.join(self.config.dump_dir, "example_trajs.log")
+        with open(self.example_trajs_path, "w") as log_file:
+            log_file.write("")
 
     async def collect_agent_trajectory(self, qid, prompt, answer, engine):
         traj_rid = uuid.uuid4().hex
@@ -295,13 +300,15 @@ class TIRWorkflow(RolloutWorkflow):
             "extracted": extracted,
         }
 
+        if self.current_trajs % 100 == 0:
+            with open(self.example_trajs_path, "a") as log_file:
+                log_file.write(res_dump['input_str'].__str__() + "\n" + res_dump['metadata'].__str__() + "\n")
         self.current_trajs += 1
 
-        if self.config.dump_dir is not None:
-            with self.dump_lock:
-                with open(self.config.dump_dir, "a") as f:
-                    json.dump(res_dump['metadata'], f)
-                    f.write("\n")
+        with self.dump_lock:
+            with open(self.config.dump_dir, "a") as f:
+                json.dump(res_dump['metadata'], f)
+                f.write("\n")
 
         res = {k: v.unsqueeze(0) for k, v in res.items()}
         return TensorDict(res, batch_size=[1])
@@ -330,6 +337,24 @@ def main(args):
     statistic_path = args[-1].split("=", 1)[1]
     args = args[:-2]
 
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
+
+    config, _ = load_expr_config(args, AgentRLConfig)
+    config: AgentRLConfig
+
+    logger.info(f"model_path: {config.sglang.model_path}")
+
+    config.dump_dir = os.path.join(
+        config.dump_dir, checkpoint_name
+    )
+    logger.info(f"dump path: {config.dump_dir}")
+
+    rank = int(os.getenv("RANK"))
+    world_size = int(os.getenv("WORLD_SIZE"))
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
+
+    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
+
     dataset_name_s = ["AIME25", "MATH-500"]
     # dataset_name_s = ["AIME25"]
 
@@ -353,19 +378,6 @@ def main(args):
             for k, v in template_stats.items():
                 stats[k] = [copy.deepcopy(v) for _ in range(len(dataset_name_s))]
 
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
-
-    config, _ = load_expr_config(args, AgentRLConfig)
-    config: AgentRLConfig
-
-    logger.info(f"model_path: {config.sglang.model_path}")
-
-
-    config.dump_dir = os.path.join(
-        "./eval/", checkpoint_name, "generated"
-    )
-    logger.info(f"dump path: {config.dump_dir}")
-
     dataset_s = [datasets.load_from_disk(f'eval_ds/{name}') for name in dataset_name_s]
 
     dataloader_s = [StatefulDataLoader(
@@ -380,7 +392,6 @@ def main(args):
     data_generator_s = [cycle(dataloader)
                         for dataloader in dataloader_s]
 
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path, force_download=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -396,11 +407,6 @@ def main(args):
 
     rollout = RemoteSGLangEngine(config.rollout)
     rollout.initialize(None, None)
-
-    rank = int(os.getenv("RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
-    assert world_size == 1, "This script is designed to run in a single process environment."
-    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
 
     for i, data_generator in enumerate(data_generator_s):
         logger.info(f"Evaluating on dataset: {dataset_name_s[i]} with {len(dataset_s[i])} samples")

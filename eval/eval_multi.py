@@ -29,7 +29,7 @@ def get_statistic_path():
     return "eval_statistic.pkl"
 
 COMMAND_TEMPLATE = """
-HF_ENDPOINT=https://hf-mirror.com python -m areal.launcher.local eval_single.py \
+HF_ENDPOINT=https://hf-mirror.com WORLD_SIZE=2 python -m areal.launcher.local eval_single.py \
     --config eval_config.yaml \
     experiment_name=tir \
     trial_name=eval \

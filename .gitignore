@@ -98,3 +98,14 @@ Desktop.ini
 *.bak
 *.orig
 *.save
+
+# ZERO-TIR-RL specific
+experiments/
+name_resolve/
+see.py
+see.sh
+ref.py
+sglang.ipynb
+sglang.yaml
+tmp.ipynb
+tmp.py

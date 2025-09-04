@@ -105,7 +105,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 10
+  freq_steps: 200
   freq_secs: 3600
 
 recover:
@@ -129,7 +129,7 @@ stats_logger:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   wandb:
-    mode: online
+    mode: offline
     entity: ez_lcw
     job_type: training
     notes: ''
@@ -143,8 +143,8 @@ launcher:
   trainer_cpus_per_gpu: 15
   trainer_mem_per_gpu: 153600
 
-verbose: false
-n_trajs: 16
-max_tokens_per_traj: 8000
+verbose: true
+n_trajs: 8
+max_tokens_per_traj: 4000
 max_turns: 128
 code_execution_timeout: 10
