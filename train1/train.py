@@ -315,8 +315,9 @@ class TIRWorkflow(RolloutWorkflow):
         avg_reward = sum([t["rewards"].item() for t in trajs]) / len(trajs)
         if avg_reward == 0:
             return None
+        std = (sum([(t["rewards"].item() - avg_reward) ** 2 for t in trajs]) / len(trajs)) ** 0.5
         for traj in trajs:
-            traj["rewards"] -= avg_reward
+            traj["rewards"] = (traj["rewards"] - avg_reward) / (std + 1e-6)
         
         return concat_padded_tensors(trajs)
 
@@ -333,7 +334,7 @@ def main(args):
 
     seeding.set_random_seed(config.seed, key=f"trainer{rank}")
 
-    with open('orz_math_57k_collected.json', 'r') as f:
+    with open('../orz_math_57k_collected.json', 'r') as f:
         raw_data = json.load(f)
     def process_raw_data(item):
         return {
