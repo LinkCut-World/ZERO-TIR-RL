@@ -144,12 +144,17 @@ launcher:
   trainer_cpus_per_gpu: 15
   trainer_mem_per_gpu: 153600
 
-verbose: true
-n_trajs: 8
-max_tokens_per_traj: 4000
-max_turns: 128
+# Workflow
+workflow:
+  n_trajs: 8
+  max_tokens_per_traj: 4000
+  max_turns: 128
 
-timeout: 5
-enable_history_code_execution: true
-pre_import_lib: true
-use_firejail: false
+# Code execution environment
+environment:
+  timeout: 5
+  enable_history_code_execution: true
+  pre_import_lib: true
+  use_firejail: false
+
+verbose: true

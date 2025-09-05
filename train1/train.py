@@ -19,6 +19,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from dataclasses import dataclass, field
 
 from areal.api.cli_args import (
+    BaseExperimentConfig,
     GRPOConfig,
     load_expr_config,
 )
@@ -38,14 +39,14 @@ from areal.utils.stats_logger import StatsLogger
 from realhf.base import logging, seeding, stats_tracker
 from realhf.impl.dataset.math_parser import extract_answer, math_equal
 
-from utils.code_execution_tool import CodeExecutionToolBox
+from utils.code_execution_tool import CodeExecutionToolBox, EnvironmentConfig
 
 from datasets import Dataset as HFDataset
 
 logger = logging.getLogger("TIR")
 
 @dataclass
-class AgentRLConfig(GRPOConfig):
+class WorkflowConfig(BaseExperimentConfig):
     max_tokens_per_traj: int = field(
         default=32000,
         metadata={
@@ -65,38 +66,11 @@ class AgentRLConfig(GRPOConfig):
         }
     )
 
+@dataclass
+class AgentRLConfig(GRPOConfig):
     # code execution environment settings
-    timeout: int = field(
-        default=10,
-        metadata={
-            "help": "timeout (in seconds) for code execution"
-        }
-    )
-    enable_history_code_execution: bool = field(
-        default=False,
-        metadata={
-            "help": "whether to enable history code execution"
-        }
-    )
-    python_path: str = field(
-        default="",
-        metadata={
-            "help": "specify the python path to run the code"
-        }
-    )
-    pre_import_lib: bool = field(
-        default=False,
-        metadata={
-            "help": "whether to pre-import some common libraries for code execution"
-        }
-    )
-    use_firejail: bool = field(
-        default=True,
-        metadata={
-            "help": "whether to use firejail to sandbox the code execution"
-        }
-    )
-
+    workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     verbose: bool = field(
         default=True,
         metadata={
@@ -116,7 +90,7 @@ The Assistant first thinks about the reasoning process in the mind and then prov
 In your reasoning-process, You can use python-code to solve your problem. Put the code within ```python and ``` tags. The script will be executed immediately and output will be returned.
 """
 
-def reward_fn(generated, answer):
+def reward_fn(generated: str, answer: str) -> tuple[str, float]:
     matches = re.findall(r"<answer>(.*?)</answer>", generated, re.DOTALL)
     if not matches:
         return None, 0.0
@@ -133,7 +107,7 @@ def reward_fn(generated, answer):
     except:
         return None, 0.0
 
-def execute_code(env, code):
+def execute_code(env: CodeExecutionToolBox, code: str) -> str:
     res = env.step(code)
     res = res["stdout"] + '\n' + res["stderr"]
     if res.strip() == "":
@@ -298,7 +272,7 @@ class TIRWorkflow(RolloutWorkflow):
         return concat_padded_tensors(trajs)
 
 def main(args):
-    swanlab.sync_wandb()
+    # swanlab.sync_wandb()
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
 
     config, _ = load_expr_config(args, AgentRLConfig)
