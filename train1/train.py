@@ -1,25 +1,24 @@
-import os
-import swanlab
-
 import asyncio
+import copy
 import os
+import pickle
+import re
+import swanlab
 import sys
+import time
 import uuid
 import json
 import gc
 import torch
 import torch.distributed as dist
-import numpy as np
-from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from dataclasses import dataclass, field
 
 from areal.api.cli_args import (
-    GenerationHyperparameters,
     GRPOConfig,
     load_expr_config,
 )
@@ -28,16 +27,20 @@ from areal.api.io_struct import (
     ModelRequest,
     WeightUpdateMeta,
 )
+from areal.api.reward_api import AsyncRewardWrapper
 from areal.api.workflow_api import RolloutWorkflow
-from areal.api.cli_args import GRPOConfig
 from areal.engine.ppo.actor import FSDPPPOActor
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.utils.data import concat_padded_tensors
 from areal.utils.device import log_gpu_stats
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
-from realhf.api.core.data_api import load_hf_tokenizer
 from realhf.base import logging, seeding, stats_tracker
+from realhf.impl.dataset.math_parser import extract_answer, math_equal
+
+from utils.code_execution_tool import CodeExecutionToolBox
+
+from datasets import Dataset as HFDataset
 
 logger = logging.getLogger("TIR")
 
@@ -49,7 +52,6 @@ class AgentRLConfig(GRPOConfig):
             "help": "maximum number of tokens per trajectory"
         }
     )
-
     max_turns: int = field(
         default=128,
         metadata={
@@ -62,10 +64,36 @@ class AgentRLConfig(GRPOConfig):
             "help": "We could collect multiple trajectories for a single query. By default n_trajs=1."
         }
     )
-    code_execution_timeout: int = field(
+
+    # code execution environment settings
+    timeout: int = field(
         default=10,
         metadata={
             "help": "timeout (in seconds) for code execution"
+        }
+    )
+    enable_history_code_execution: bool = field(
+        default=False,
+        metadata={
+            "help": "whether to enable history code execution"
+        }
+    )
+    python_path: str = field(
+        default="",
+        metadata={
+            "help": "specify the python path to run the code"
+        }
+    )
+    pre_import_lib: bool = field(
+        default=False,
+        metadata={
+            "help": "whether to pre-import some common libraries for code execution"
+        }
+    )
+    use_firejail: bool = field(
+        default=True,
+        metadata={
+            "help": "whether to use firejail to sandbox the code execution"
         }
     )
 
@@ -82,95 +110,38 @@ class AgentRLConfig(GRPOConfig):
         }
     )
 
-import json
-
-from itertools import cycle
-
-from concurrent.futures import ProcessPoolExecutor
-
-
-from realhf.impl.dataset.math_parser import extract_answer, math_equal
-
-rw_executor = ProcessPoolExecutor(max_workers=4)
-REWARD_TIMEOUT_SECONDS = 15
-
-def reward_fn(generated, answer):
-    try:
-        x = extract_answer(generated, "math", use_last_number=True)
-        y = extract_answer(answer, "math", use_last_number=True)
-
-        if x is None or x.strip() in ["None", "none", ""]:
-            return 0.0
-        elif y is None or y.strip() in ["None", "none", ""]:
-            return 0.0
-        return float(math_equal(x, y, timeout=False))
-    except:
-        return 0.0
-
-
-import asyncio
-import functools
-import os
-import time
-import uuid
-
-import colorama
-import torch
-from tensordict import TensorDict
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
-from areal.api.cli_args import GenerationHyperparameters
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import (
-    AllocationMode,
-    FinetuneSpec,
-    ModelRequest,
-    WeightUpdateMeta,
-)
-from areal.api.workflow_api import RolloutWorkflow
-from areal.engine.ppo.actor import FSDPPPOActor
-from areal.engine.sglang_remote import RemoteSGLangEngine
-from areal.utils.data import concat_padded_tensors
-from areal.utils.device import log_gpu_stats
-
-import re
-
-
-# PROMPT_TEMPLATE = """
-# A conversation between User and Assistant. 
-# The User asks a question, and the Assistant solves it. 
-# The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. 
-# In your reasoning-process, You can use python-code to solve your problem. Put the code within ```python and ``` tags, and the code will be executed immediately and output will be returned.
-# User: You must put your answer inside <answer> </answer> tags, i.e., <answer> answer here </answer>. 
-# And your final answer will be extracted automatically by the \\boxed{{}} tag.\nThis is the problem:{query}\nAssistant: <think>
-# """
-
-# def get_prompt(tokenizer, query):
-#     return PROMPT_TEMPLATE.format(query=query)
-
 SYSTEM_PROMPT = """
 You are a helpful assistant. The User asks a question, and the Assistant solves it. 
 The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. And your final answer will be extracted automatically by the \\boxed{{}} tag.
 In your reasoning-process, You can use python-code to solve your problem. Put the code within ```python and ``` tags. The script will be executed immediately and output will be returned.
 """
 
-def get_prompt(tokenizer, query):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": query}
-    ]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    text += "<think>\n"
-    return text
+def reward_fn(generated, answer):
+    matches = re.findall(r"<answer>(.*?)</answer>", generated, re.DOTALL)
+    if not matches:
+        return None, 0.0
+    generated = matches[-1]
+    try:
+        x = extract_answer(generated, "math", use_last_number=True)
+        y = extract_answer(answer, "math", use_last_number=True)
 
-import re
-import threading
+        if x is None or x.strip() in ["None", "none", ""]:
+            return x, 0.0
+        elif y is None or y.strip() in ["None", "none", ""]:
+            return x, 0.0
+        return x, float(math_equal(x, y, timeout=False))
+    except:
+        return None, 0.0
 
-from code_executor import execute_code
-
-import shutil
-import pickle
-from datasets import Dataset as HFDataset
+def execute_code(env, code):
+    res = env.step(code)
+    res = res["stdout"] + '\n' + res["stderr"]
+    if res.strip() == "":
+        res = "No output. Let me use `print()` to see the result and try again.\n"
+    if len(res) > 2000:
+        res = res[:2000] + "\n...[truncated]"
+    res = "\n```output\n" + res + "\n```\n"
+    return res
 
 class TIRWorkflow(RolloutWorkflow):
     def __init__(
@@ -183,6 +154,15 @@ class TIRWorkflow(RolloutWorkflow):
         self.gconfig.n_samples = 1
         self.tokenizer = tokenizer
         self.current_trajs = 0
+        self.code_env = CodeExecutionToolBox(
+            timeout=config.timeout,
+            enable_history_code_execution=config.enable_history_code_execution,
+            python_path=config.python_path,
+            pre_import_lib=config.pre_import_lib,
+            use_firejail=config.use_firejail,
+        )
+        self.async_reward_fn = AsyncRewardWrapper(reward_fn)
+        self.async_code_exec = AsyncRewardWrapper(execute_code)
 
         self.example_trajs_path = "example_trajs.log"
         with open(self.example_trajs_path, "w") as log_file:
@@ -190,16 +170,15 @@ class TIRWorkflow(RolloutWorkflow):
 
     async def collect_agent_trajectory(self, qid, prompt, answer, engine):
         traj_rid = uuid.uuid4().hex
-        loop = asyncio.get_event_loop()
-        result = None
-        reward = 0.0
 
         num_turns = 0
+        stops = ["```python", "</answer>"]
+
         input_str = prompt
         input_ids = self.tokenizer.encode(input_str, add_special_tokens=False)
         logprobs = [0.0] * len(input_ids)
         loss_mask = [0] * len(input_ids)
-        stops = ["```python", "</answer>"]
+        
         total_gen_time = 0
         total_exec_time = 0
         start_time = time.time()
@@ -225,14 +204,7 @@ class TIRWorkflow(RolloutWorkflow):
             loss_mask += [1] * len(resp.output_tokens)
 
             if "</answer>" in completion_str:
-                matches = re.findall(r"<answer>(.*?)</answer>", completion_str, re.DOTALL)
-                if matches:
-                    result = matches[-1]
-                    reward = await loop.run_in_executor(
-                        rw_executor,
-                        functools.partial(reward_fn, result, answer)
-                    )
-                    break
+                break
             elif stops[0] == "```python" and "```python" in completion_str:
                 stops[0] = "```"
             elif stops[0] == "```" and "```" in completion_str:
@@ -240,17 +212,12 @@ class TIRWorkflow(RolloutWorkflow):
                 if matches:
                     code = matches[-1]
                     exec_start_time = time.time()
-                    execution_output = await loop.run_in_executor(None, functools.partial(execute_code, code, self.config.code_execution_timeout))
-
+                    execution_output = await self.async_code_exec(self.code_env, code)
                     exec_time = time.time() - exec_start_time
                     total_exec_time += exec_time
                     
                     num_turns += 1
-                    
-                    empty_output = execution_output.strip() == ""
-                    execution_output = "\n```output\n" + execution_output + "\n```\n"
-                    if empty_output:
-                        execution_output += "No output. Let me use `print()` to see the result and try again.\n"
+
                     input_str += execution_output
                     exec_tokens = self.tokenizer.encode(execution_output, add_special_tokens=False)
                     if len(input_ids) + len(exec_tokens) >= self.config.max_tokens_per_traj:
@@ -263,39 +230,41 @@ class TIRWorkflow(RolloutWorkflow):
             if resp.output_tokens[-1] in [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
                 break
 
+        extracted, reward = await self.async_reward_fn(input_str, answer=answer)
+
         total_time = time.time() - start_time
 
-        if len(input_ids) > self.config.max_tokens_per_traj:
-            assert False, f"Trajectory {traj_rid} exceeds max tokens {self.config.max_tokens_per_traj} with {len(input_ids)} tokens."
+        assert len(input_ids) <= self.config.max_tokens_per_traj, f"Trajectory {traj_rid} exceeds max tokens {self.config.max_tokens_per_traj} with {len(input_ids)} tokens."
         
+        stats = dict(
+            score=torch.tensor(float(reward)),
+            num_turns=torch.tensor(num_turns),
+            code_reward=torch.tensor(float(num_turns>0)),
+            code_in_correct=torch.tensor(float(num_turns>0 and reward>0)),
+            length=torch.tensor(len(input_ids)),
+            total_time=torch.tensor(total_time),
+            gen_time=torch.tensor(total_gen_time),
+            exec_time=torch.tensor(total_exec_time),
+        )
         res = dict(
             input_ids=torch.tensor(input_ids),
             logprobs=torch.tensor(logprobs),
             loss_mask=torch.tensor(loss_mask, dtype=torch.bool),
             rewards=torch.tensor(float(reward)),
-            score=torch.tensor(float(reward)),
-            code_reward=torch.tensor(float(num_turns>0)),
-            code_in_correct=torch.tensor(float(num_turns>0 and reward>0)),
             attention_mask=torch.ones(len(input_ids), dtype=torch.bool),
         )
-
-        res_dump = {k: v.tolist() for k, v in res.items() if k != 'attention_mask' and k != 'rewards'}
-        res_dump['input_str'] = input_str
-        res_dump['metadata'] = {
-            "reward": reward,
-            "traj_rid": traj_rid,
-            "num_turns": num_turns,
-            "length": len(input_ids),
-            "total_time": f"{total_time:.2f}s",
-            "gen_time_ratio": f"{total_gen_time / total_time:.2f}" if total_time > 0 else "0.00",
-            "exec_time_ratio": f"{total_exec_time / total_time:.2f}" if total_time > 0 else "0.00",
-            "answer": answer,
-            "result": result,
-        }
+        res.update(stats)
 
         if self.current_trajs % 100 == 0:
+            dump = copy.copy(stats)
+            dump.update(dict(
+                gen_time_ratio=f"{total_gen_time / total_time:.2f}" if total_time > 0 else "0.00",
+                exec_time_ratio=f"{total_exec_time / total_time:.2f}" if total_time > 0 else "0.00",
+                answer=answer,
+                extracted=extracted,
+            ))
             with open(self.example_trajs_path, "a") as log_file:
-                log_file.write(res_dump['input_str'].__str__() + "\n" + res_dump['metadata'].__str__() + "\n")
+                log_file.write(input_str + "\n" + dump.__str__() + "\n\n")
         self.current_trajs += 1
 
         res = {k: v.unsqueeze(0) for k, v in res.items()}
@@ -304,8 +273,15 @@ class TIRWorkflow(RolloutWorkflow):
     async def arun_episode(self, engine, data):
         qid = uuid.uuid4().hex
 
-        # prompt = PROMPT_TEMPLATE.format(query=data["question"])
-        prompt = get_prompt(self.tokenizer, data["question"])
+        prompt = self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": data["question"]}
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt += "<think>\n"
 
         trajs = await asyncio.gather(*[
             self.collect_agent_trajectory(qid, prompt, data["answer"], engine)
@@ -345,7 +321,6 @@ def main(args):
     hf_dataset = HFDataset.from_list(dataset)
     dataset = split_dataset_by_node(hf_dataset, rank=rank, world_size=world_size)
 
-    worker_batch_size = config.train_dataset.batch_size // world_size
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=config.train_dataset.batch_size // world_size,
@@ -396,7 +371,7 @@ def main(args):
 
     data_generator = iter(dataloader)
     start_step = config.recover_start_step or 0
-    log_debug_batch = False
+    log_debug_batch = 0
     for global_step in range(start_step, max_steps):
         epoch = global_step // steps_per_epoch
         step = global_step % steps_per_epoch
@@ -417,13 +392,14 @@ def main(args):
                     data = next(data_generator)
                 batch = rollout.rollout_batch(data, workflow=workflow)
 
-        avg_reward = batch["score"].mean().item()
-        avg_code_reward = batch["code_reward"].mean().item()
-        avg_code_in_correct = batch["code_in_correct"].mean().item()
-        avg_length = (batch["attention_mask"].sum(1)).float().mean().item()
+        d = {}
+        for key in batch.keys():
+            shape = batch[key].shape
+            if len(shape) == 1 or (len(shape) == 2 and shape[1] == 1):
+                d[key] = batch[key].float().mean().item()
 
-        if (not log_debug_batch) and avg_code_reward > 0:
-            log_debug_batch = True
+        if batch["num_turns"].float().max().item() >= log_debug_batch:
+            log_debug_batch = batch["num_turns"].float().max().item()
             with open("debug_batch.pkl", "wb") as log_file:
                 pickle.dump(batch, log_file)
 
@@ -474,10 +450,8 @@ def main(args):
         with stats_tracker.record_timing("save"):
             saver.save(actor, epoch, step, global_step)
 
-        stats[0]["avg_reward"] = avg_reward
-        stats[0]["avg_code_reward"] = avg_code_reward
-        stats[0]["avg_code_in_correct"] = avg_code_in_correct
-        stats[0]["avg_length"] = avg_length
+        for k, v in d.items():
+            stats[0]["stat/" + k] = v
         stat_logger.commit(epoch, step, global_step, stats)
 
     stat_logger.close()
