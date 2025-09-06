@@ -19,7 +19,7 @@ def get_checkpoints():
                 "path": path,
                 "step": step,
             })
-    key_steps = [599, 1999, 3999]
+    key_steps = [599, 1199, 1799, 2399, 2999, 3599, 4199]
     checkpoint_s = [checkpoint for checkpoint in checkpoint_s if checkpoint["step"] in key_steps]
     checkpoint_s.append({"name": "step0", "path": "Qwen/Qwen2.5-1.5B", "step": 0})
     checkpoint_s = sorted(checkpoint_s, key=lambda x: x["step"])
@@ -29,7 +29,7 @@ def get_statistic_path():
     return "eval_statistic.pkl"
 
 COMMAND_TEMPLATE = """
-HF_ENDPOINT=https://hf-mirror.com WORLD_SIZE=2 python -m areal.launcher.local eval_single.py \
+HF_ENDPOINT=https://hf-mirror.com WORLD_SIZE=2 OC_CAUSE=1 python -m areal.launcher.local eval_single.py \
     --config eval_config.yaml \
     experiment_name=tir \
     trial_name=eval \

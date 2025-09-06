@@ -1,9 +1,8 @@
 from .python_code import execute_python
 from dataclasses import dataclass, field
-from areal.api.cli_args import BaseExperimentConfig
 
 @dataclass
-class EnvironmentConfig(BaseExperimentConfig):
+class EnvironmentConfig:
     timeout: int = field(
         default=10,
         metadata={
@@ -41,7 +40,7 @@ class CodeExecutionToolBox:
         self.previous_codes = []
 
     def step(self, action: str):
-        if self.enable_history_code_execution:
+        if self.config.enable_history_code_execution:
             self.previous_codes.append(action)
             codes = self.previous_codes
         else:

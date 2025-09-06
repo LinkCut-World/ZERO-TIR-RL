@@ -19,7 +19,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from dataclasses import dataclass, field
 
 from areal.api.cli_args import (
-    BaseExperimentConfig,
+    GenerationHyperparameters,
     GRPOConfig,
     load_expr_config,
 )
@@ -46,7 +46,7 @@ from datasets import Dataset as HFDataset
 logger = logging.getLogger("TIR")
 
 @dataclass
-class WorkflowConfig(BaseExperimentConfig):
+class WorkflowConfig:
     max_tokens_per_traj: int = field(
         default=32000,
         metadata={
@@ -68,7 +68,6 @@ class WorkflowConfig(BaseExperimentConfig):
 
 @dataclass
 class AgentRLConfig(GRPOConfig):
-    # code execution environment settings
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     verbose: bool = field(
@@ -119,22 +118,19 @@ def execute_code(env: CodeExecutionToolBox, code: str) -> str:
 
 class TIRWorkflow(RolloutWorkflow):
     def __init__(
-        self, 
-        config: AgentRLConfig, 
+        self,
+        config: WorkflowConfig,
+        gconfig: GenerationHyperparameters,
+        envconfig: EnvironmentConfig,
         tokenizer: PreTrainedTokenizerFast,
     ):
         self.config = config
-        self.gconfig = config.gconfig
+        self.gconfig = gconfig
         self.gconfig.n_samples = 1
+        self.envconfig = envconfig
         self.tokenizer = tokenizer
         self.current_trajs = 0
-        self.code_env = CodeExecutionToolBox(
-            timeout=config.timeout,
-            enable_history_code_execution=config.enable_history_code_execution,
-            python_path=config.python_path,
-            pre_import_lib=config.pre_import_lib,
-            use_firejail=config.use_firejail,
-        )
+        self.code_env = CodeExecutionToolBox(envconfig)
         self.async_reward_fn = AsyncRewardWrapper(reward_fn)
         self.async_code_exec = AsyncRewardWrapper(execute_code)
 
@@ -332,7 +328,9 @@ def main(args):
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
 
     workflow = TIRWorkflow(
-        config=config,
+        config=config.workflow,
+        gconfig=config.gconfig,
+        envconfig=config.environment,
         tokenizer=tokenizer,
     )
 

@@ -23,9 +23,9 @@ rollout:
   enable_rollout_tracing: false
 
 gconfig:
-  n_samples: 4
+  n_samples: 1
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 1024
   greedy: false
   temperature: 1.0
 
@@ -51,10 +51,11 @@ actor:
 
   group_size: ${gconfig.n_samples}
   group_adv_norm: false
+  adv_norm: false
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
-  reward_scaling: 10.0
-  reward_bias: -0.5
+  reward_scaling: 1.0
+  reward_bias: 0
   kl_ctl: 0.0
   ppo_n_minibatches: 1
   recompute_logprob: true
@@ -81,22 +82,23 @@ sglang:
   max_running_requests: null
   context_length: 32768
   mem_fraction_static: 0.8
+  attention_backend: fa3
 
 # datasets
 train_dataset:
-  batch_size: 8
+  batch_size: 1
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hardcoded
   type: rl
 
 valid_dataset:
-  batch_size: 8
+  batch_size: 1
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: no_validation
   type: rl
 
 # Utilities
@@ -105,7 +107,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 200
+  freq_steps: 600
   freq_secs: 3600
 
 recover:
@@ -143,6 +145,17 @@ launcher:
   trainer_cpus_per_gpu: 15
   trainer_mem_per_gpu: 153600
 
-verbose: false
-n_trajs: 8
-max_tokens_per_traj: 4000
+# Workflow
+workflow:
+  n_trajs: 8
+  max_tokens_per_traj: 4000
+  max_turns: 128
+
+# Code execution environment
+environment:
+  timeout: 5
+  enable_history_code_execution: true
+  pre_import_lib: true
+  use_firejail: false
+
+verbose: true
